@@ -114,15 +114,20 @@ func NewEtcdRegistry(servers []string) Registry {
 	if err != nil {
 		panic(err)
 	}
-	api := etcdCli.NewKeysAPI(c)
+	return NewEtcdRegistryFromClient(c)
+}
+
+func NewEtcdRegistryFromClient(cli etcdCli.Client) Registry {
+
+	api := etcdCli.NewKeysAPI(cli)
 	return &etcdRegistry{
-		client:  &c,
+		client:  cli,
 		keysApi: api,
 	}
 }
 
 type etcdRegistry struct {
-	client  *etcdCli.Client
+	client  etcdCli.Client
 	keysApi etcdCli.KeysAPI
 }
 
