@@ -16,7 +16,7 @@ limitations under the License.
 
 // Utility to perform master election/failover using etcd.
 
-package utils
+package etcdlock
 
 import (
 	"errors"
@@ -25,8 +25,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/coreos/go-etcd/etcd"
-	"github.com/golang/glog"
+	"github.com/Sirupsen/logrus"
+	etcd "github.com/coreos/etcd/client"
 )
 
 const kRetrySleep time.Duration = 100 // milliseconds
@@ -69,7 +69,7 @@ type etcdLock struct {
 	client        Registry         // etcd interface
 	name          string           // name of the lock
 	id            string           // identity of the lockholder
-	ttl           uint64           // ttl of the lock
+	ttl           time.Duration    // ttl of the lock
 	enabled       bool             // Used to enable/disable the lock
 	master        string           // Lock holder
 	watchStopCh   chan bool        // To stop the watch
@@ -82,7 +82,7 @@ type etcdLock struct {
 
 // Method to create a new etcd lock.
 func NewMaster(client Registry, name string, id string,
-	ttl uint64) (MasterInterface, error) {
+	ttl time.Duration) (MasterInterface, error) {
 	// client is mandatory. Min ttl is 5 seconds.
 	if client == nil || ttl < 5 {
 		return nil, errors.New("Invalid args")
@@ -101,13 +101,13 @@ func NewMaster(client Registry, name string, id string,
 
 // Method to start the attempt to acquire the lock.
 func (e *etcdLock) Start() {
-	glog.Infof("Starting attempt to acquire lock %s", e.name)
+	logrus.Debugf("Starting attempt to acquire lock %s", e.name)
 
 	e.Lock()
 	if e.enabled {
 		e.Unlock()
 		// Already running
-		glog.Warningf("Duplicate Start for lock %s", e.name)
+		logrus.Warningf("Duplicate Start for lock %s", e.name)
 		return
 	}
 
@@ -128,13 +128,13 @@ func (e *etcdLock) Start() {
 
 // Method to stop the acquisition of lock and release it if holding the lock.
 func (e *etcdLock) Stop() {
-	glog.Infof("Stopping attempt to acquire lock %s", e.name)
+	logrus.Debugf("Stopping attempt to acquire lock %s", e.name)
 
 	e.Lock()
 	if !e.enabled {
 		e.Unlock()
 		// Not running
-		glog.Warningf("Duplicate Stop for lock %s", e.name)
+		logrus.Warningf("Duplicate Stop for lock %s", e.name)
 		return
 	}
 
@@ -176,7 +176,7 @@ func (e *etcdLock) acquire() (ret error) {
 			}
 			errMsg := fmt.Sprintf("Recovered from panic: %#v (%v)\n%v",
 				r, r, callers)
-			glog.Errorf(errMsg)
+			logrus.Errorf(errMsg)
 			ret = errors.New(errMsg)
 		}
 	}()
@@ -190,11 +190,11 @@ func (e *etcdLock) acquire() (ret error) {
 		// abort the acquire routine.
 		if !e.enabled {
 			if e.holding {
-				glog.V(2).Infof("Deleting lock %s", e.name)
+				logrus.Debugf("Deleting lock %s", e.name)
 				// Delete the lock so other nodes can get it sooner.
 				// Otherwise, they have to wait until ttl expiry.
 				if _, err = e.client.Delete(e.name, false); err != nil {
-					glog.V(2).Infof("Failed to delete lock %s, "+
+					logrus.Debugf("Failed to delete lock %s, "+
 						"error %v", e.name, err)
 				}
 				e.holding = false
@@ -216,14 +216,14 @@ func (e *etcdLock) acquire() (ret error) {
 			if err != nil {
 				if IsEtcdNotFound(err) {
 					// Try to acquire the lock.
-					glog.V(2).Infof("Trying to acquire lock %s", e.name)
+					logrus.Debugf("Trying to acquire lock %s", e.name)
 					resp, err = e.client.Create(e.name, e.id, e.ttl)
 					if err != nil {
 						// Failed to acquire the lock.
 						continue
 					}
 				} else {
-					glog.V(2).Infof("Failed to get lock %s, error: %v",
+					logrus.Debugf("Failed to get lock %s, error: %v",
 						e.name, err)
 					time.Sleep(kRetrySleep * time.Millisecond)
 					continue
@@ -236,7 +236,7 @@ func (e *etcdLock) acquire() (ret error) {
 			if !e.holding {
 				// If not already holding the lock, send an
 				// event and start the refresh routine.
-				glog.Infof("Acquired lock %s", e.name)
+				logrus.Debugf("Acquired lock %s", e.name)
 				e.holding = true
 				e.eventsCh <- MasterEvent{Type: MasterAdded,
 					Master: e.id}
@@ -247,7 +247,7 @@ func (e *etcdLock) acquire() (ret error) {
 			if e.holding {
 				// If previously holding the lock, stop the
 				// refresh routine and send a deleted event.
-				glog.Errorf("Lost lock %s to %s", e.name,
+				logrus.Errorf("Lost lock %s to %s", e.name,
 					resp.Node.Value)
 				e.holding = false
 				e.refreshStopCh <- true
@@ -273,20 +273,20 @@ func (e *etcdLock) acquire() (ret error) {
 		// is returning EtcdIndex lower than ModifiedIndex. In such
 		// cases, use ModifiedIndex to set the watch.
 		// TODO: Change this code when etcd behavior changes.
-		if resp.EtcdIndex < resp.Node.ModifiedIndex {
+		if resp.Index < resp.Node.ModifiedIndex {
 			prevIndex = resp.Node.ModifiedIndex + 1
 		} else {
-			prevIndex = resp.EtcdIndex + 1
+			prevIndex = resp.Index + 1
 		}
 
 		// Start watching for changes to lock.
 		resp, err = e.client.Watch(e.name, prevIndex, false, nil, e.watchStopCh)
 		if IsEtcdWatchStoppedByUser(err) {
-			glog.Infof("Watch for lock %s stopped by user", e.name)
+			logrus.Debugf("Watch for lock %s stopped by user", e.name)
 		} else if err != nil {
 			// Log only if its not too old event index error.
 			if !IsEtcdEventIndexCleared(err) {
-				glog.Errorf("Failed to watch lock %s, error %v",
+				logrus.Errorf("Failed to watch lock %s, error %v",
 					e.name, err)
 			}
 		}
@@ -300,7 +300,7 @@ func (e *etcdLock) refresh() {
 	for {
 		select {
 		case <-e.refreshStopCh:
-			glog.V(2).Infof("Stopping refresh for lock %s", e.name)
+			logrus.Debugf("Stopping refresh for lock %s", e.name)
 			// Lock released.
 			return
 		case <-time.After(time.Second * time.Duration(e.ttl*4/10)):
@@ -313,7 +313,7 @@ func (e *etcdLock) refresh() {
 				// acquired the lock. Should also get a watch
 				// notification if that happens and this go routine
 				// is stopped there.
-				glog.Errorf("Failed to set the ttl for lock %s with "+
+				logrus.Errorf("Failed to set the ttl for lock %s with "+
 					"error: %s", e.name, err.Error())
 			} else {
 				e.modifiedIndex = resp.Node.ModifiedIndex
